@@ -18,6 +18,7 @@ class GiveawaySystem(commands.Cog):
         self.allowed_user_ids = [1234, 1234]
         self.allowed_role_ids = [1234, 1234]
         self.msk_tz = timezone(timedelta(hours=3))
+        self.processing_users = set()
         self.load_giveaways()
 
     def _to_aware_utc(self, dt: datetime) -> datetime:
@@ -68,6 +69,9 @@ class GiveawaySystem(commands.Cog):
         try:
             save_data = {}
             for giveaway_id, giveaway_data in self.active_giveaways.items():
+                if giveaway_data.get('status') == 'ended':
+                    continue
+                    
                 save_data[giveaway_id] = giveaway_data.copy()
                 
                 save_data[giveaway_id]['end_time'] = giveaway_data['end_time'].isoformat()
@@ -215,46 +219,56 @@ class GiveawaySystem(commands.Cog):
     def format_end_time(self, end_time):
         return self._to_msk(end_time).strftime("%d.%m.%Y %H:%M MSK")
     
-    def create_giveaway_content(self, giveaway_data):
+    def create_giveaway_embed(self, giveaway_data):
         end_time_formatted = self.format_end_time(giveaway_data['end_time'])
         time_left = self.format_time_left(giveaway_data['end_time'])
         status = giveaway_data.get('status', 'active')
         
-        content_text = f"# РОЗЫГРЫШ\n\n"
+        status_emojis = {
+            'active': '🎉',
+            'ended': '🏁',
+            'paused': '⏸️'
+        }
         
-        if status == 'active':
-            content_text += f"## {giveaway_data['prize']}\n\n"
-        elif status == 'ended':
-            content_text += f"## {giveaway_data['prize']} (ЗАВЕРШЁН)\n\n"
-        elif status == 'paused':
-            content_text += f"## {giveaway_data['prize']} (ПРИОСТАНОВЛЕН)\n\n"
+        embed = discord.Embed(
+            title=f"{status_emojis.get(status, '🎉')} {giveaway_data['prize']}",
+            color=config.COLORS["SUCCESS"] if status == 'active' else config.COLORS["INFO"]
+        )
         
         winners_count = giveaway_data.get('winners_count', 1)
+        participants_count = len(giveaway_data['participants'])
+        
+        description = ""
+        
         if winners_count > 1:
-            content_text += f"**Победителей:** {winners_count}\n\n"
+            description += f"**Победителей:** {winners_count}\n\n"
         
         if giveaway_data.get('required_roles'):
-            roles_text = "\n".join([f"<@&{role_id}>" for role_id in giveaway_data['required_roles']])
-            content_text += f"**Требуемые роли:**\n{roles_text}\n\n"
+            roles_text = ", ".join([f"<@&{role_id}>" for role_id in giveaway_data['required_roles']])
+            description += f"**Требуемые роли:** {roles_text}\n\n"
         else:
-            content_text += f"**Участие:** Открыто для всех\n\n"
+            description += f"**Участие:** Открыто для всех\n\n"
         
-        participants_count = len(giveaway_data['participants'])
-        content_text += f"**Заканчивается:** {end_time_formatted}\n"
+        description += f"**Заканчивается:** {end_time_formatted}\n"
         
         if status == 'active':
-            content_text += f"**Осталось:** {time_left}\n\n"
+            description += f"**Осталось:** {time_left}\n\n"
         else:
-            content_text += f"**Статус:** {self.get_status_text(status)}\n\n"
+            description += f"**Статус:** {self.get_status_text(status)}\n\n"
         
-        content_text += f"**Участников:** {participants_count}\n\n"
+        description += f"**Участников:** {participants_count}\n\n"
         
         if status == 'active':
-            content_text += "Нажмите на кнопку ниже, чтобы участвовать!"
+            description += "Нажмите на кнопку ниже, чтобы участвовать!"
         elif status == 'paused':
-            content_text += "Розыгрыш приостановлен."
+            description += "Розыгрыш приостановлен."
         
-        return content_text
+        embed.description = description
+        
+        if status == 'active':
+            embed.set_footer(text=f"ID: {list(self.active_giveaways.keys())[list(self.active_giveaways.values()).index(giveaway_data)] if giveaway_data in self.active_giveaways.values() else 'Unknown'}")
+        
+        return embed
     
     def get_status_text(self, status):
         status_texts = {
@@ -266,47 +280,10 @@ class GiveawaySystem(commands.Cog):
     
     async def send_giveaway_message(self, channel, giveaway_data, giveaway_id):
         try:
-            content_text = self.create_giveaway_content(giveaway_data)
-            
-            component_data = {
-                'type': 17,
-                'accent_color': None,
-                'spoiler': False,
-                'components': [{
-                    'type': 10,
-                    'content': content_text
-                }]
-            }
-            
-            headers = {
-                'Authorization': f'Bot {config.TOKEN}',
-                'Content-Type': 'application/json'
-            }
-            
-            payload = {
-                'content': None,
-                'components': [component_data],
-                'flags': 32768
-            }
-            
-            url = f'https://discord.com/api/v10/channels/{channel.id}/messages'
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload) as response:
-                    if response.status == 200:
-                        message_data = await response.json()
-                        message_id = message_data['id']
-                        message = await channel.fetch_message(message_id)
-                        return message
-                    else:
-                        error_text = await response.text()
-                        print(f"API Error when sending: {response.status} - {error_text}")
-                        return None
-                        
+            embed = self.create_giveaway_embed(giveaway_data)
+            return await channel.send(embed=embed)
         except Exception as e:
             print(f"Error sending message: {e}")
-            import traceback
-            traceback.print_exc()
             return None
     
     async def update_giveaway_embed(self, giveaway_id, giveaway_data):
@@ -318,43 +295,21 @@ class GiveawaySystem(commands.Cog):
             if not channel:
                 return
             
-            content_text = self.create_giveaway_content(giveaway_data)
-            
-            component_data = {
-                'type': 17,
-                'accent_color': None,
-                'spoiler': False,
-                'components': [{
-                    'type': 10,
-                    'content': content_text
-                }]
-            }
-            
-            headers = {
-                'Authorization': f'Bot {config.TOKEN}',
-                'Content-Type': 'application/json'
-            }
-            
-            payload = {
-                'content': None,
-                'components': [component_data],
-                'flags': 32768
-            }
-            
-            url = f'https://discord.com/api/v10/channels/{channel.id}/messages/{giveaway_data["message_id"]}'
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.patch(url, headers=headers, json=payload) as response:
-                    if response.status == 200:
-                        return True
-                    elif response.status == 404:
-                        print(f"Giveaway message {giveaway_id} not found.")
-                        return False
-                    else:
-                        error_text = await response.text()
-                        print(f"API Error when updating: {response.status} - {error_text}")
-                        return False
-                        
+            try:
+                message = await channel.fetch_message(giveaway_data['message_id'])
+                embed = self.create_giveaway_embed(giveaway_data)
+                await message.edit(embed=embed)
+                return True
+            except discord.NotFound:
+                print(f"Giveaway message {giveaway_id} not found.")
+                return False
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    await asyncio.sleep(e.retry_after)
+                    return await self.update_giveaway_embed(giveaway_id, giveaway_data)
+                print(f"HTTP error when updating: {e}")
+                return False
+                
         except Exception as e:
             print(f"Error updating embed: {e}")
             return False
@@ -424,7 +379,7 @@ class GiveawaySystem(commands.Cog):
                     label="Участвовать",
                     style=discord.ButtonStyle.green,
                     custom_id=f"giveaway_{giveaway_id}",
-                    emoji="\U0001f389"
+                    emoji="🎉"
                 )
                 button.callback = participate_callback
                 view.add_item(button)
@@ -524,7 +479,7 @@ class GiveawaySystem(commands.Cog):
                     label="Участвовать",
                     style=discord.ButtonStyle.green,
                     custom_id=f"giveaway_{giveaway_id}",
-                    emoji="\U0001f389"
+                    emoji="🎉"
                 )
                 button.callback = participate_callback
                 view.add_item(button)
@@ -623,114 +578,111 @@ class GiveawaySystem(commands.Cog):
         
         return thread
     
-    @tasks.loop(seconds=60)
-    async def update_giveaway_embeds(self):
-        if not self.active_giveaways:
-            return
-        
-        for giveaway_id, giveaway_data in list(self.active_giveaways.items()):
-            if giveaway_data.get('status') == 'active':
-                if 'thread_id' in giveaway_data and not giveaway_data.get('thread'):
-                    try:
-                        channel = self.bot.get_channel(giveaway_data['channel_id'])
-                        if channel:
-                            message = await channel.fetch_message(giveaway_data['message_id'])
-                            giveaway_data['thread'] = discord.utils.get(message.threads, id=giveaway_data['thread_id'])
-                    except:
-                        pass
-                
-                await self.update_giveaway_embed(giveaway_id, giveaway_data)
-    
     async def handle_participation(self, interaction: discord.Interaction, giveaway_id: str, giveaway_data: dict):
-        if giveaway_data.get('status') != 'active':
-            embed = discord.Embed(
-                title="Розыгрыш неактивен",
-                description="Этот розыгрыш в данный момент неактивен!",
-                color=config.COLORS["ERROR"]
+        user_key = f"{giveaway_id}_{interaction.user.id}"
+        
+        if user_key in self.processing_users:
+            await interaction.response.send_message(
+                "Ваша заявка уже обрабатывается...", 
+                ephemeral=True
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         
-        if self._now_utc() >= giveaway_data['end_time']:
-            embed = discord.Embed(
-                title="Розыгрыш завершён",
-                description="Этот розыгрыш уже закончился!",
-                color=config.COLORS["ERROR"]
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
+        self.processing_users.add(user_key)
         
-        if giveaway_data.get('required_roles'):
-            member_roles = [role.id for role in interaction.user.roles]
-            has_required_role = any(role_id in member_roles for role_id in giveaway_data['required_roles'])
-            
-            if not has_required_role:
-                role_mentions = []
-                for role_id in giveaway_data['required_roles']:
-                    role = interaction.guild.get_role(role_id)
-                    if role:
-                        role_mentions.append(role.mention)
-                
+        try:
+            if giveaway_data.get('status') != 'active':
                 embed = discord.Embed(
-                    title="Доступ запрещён",
-                    description=f"Требуемые роли для участия:\n{' '.join(role_mentions)}",
+                    title="Розыгрыш неактивен",
+                    description="Этот розыгрыш в данный момент неактивен!",
                     color=config.COLORS["ERROR"]
                 )
                 await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
-        
-        if interaction.user.id in giveaway_data['participants']:
+            
+            if self._now_utc() >= giveaway_data['end_time']:
+                embed = discord.Embed(
+                    title="Розыгрыш завершён",
+                    description="Этот розыгрыш уже закончился!",
+                    color=config.COLORS["ERROR"]
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+            
+            if giveaway_data.get('required_roles'):
+                member_roles = [role.id for role in interaction.user.roles]
+                has_required_role = any(role_id in member_roles for role_id in giveaway_data['required_roles'])
+                
+                if not has_required_role:
+                    role_mentions = []
+                    for role_id in giveaway_data['required_roles']:
+                        role = interaction.guild.get_role(role_id)
+                        if role:
+                            role_mentions.append(role.mention)
+                    
+                    embed = discord.Embed(
+                        title="Доступ запрещён",
+                        description=f"Требуемые роли для участия:\n{' '.join(role_mentions)}",
+                        color=config.COLORS["ERROR"]
+                    )
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
+                    return
+            
+            if interaction.user.id in giveaway_data['participants']:
+                embed = discord.Embed(
+                    title="Уже участвуете",
+                    description="Вы уже зарегистрированы в этом розыгрыше!",
+                    color=config.COLORS["INFO"]
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+            
+            giveaway_data['participants'].append(interaction.user.id)
+            await self.update_giveaway_embed(giveaway_id, giveaway_data)
+            
+            participants_count = len(giveaway_data['participants'])
+            winners_count = giveaway_data.get('winners_count', 1)
+            
             embed = discord.Embed(
-                title="Уже участвуете",
-                description="Вы уже зарегистрированы в этом розыгрыше!",
-                color=config.COLORS["INFO"]
+                title="Вы участвуете!",
+                description=(
+                    f"Вы успешно зарегистрировались в розыгрыше **{giveaway_data['prize']}**!\n\n"
+                    f"**Шанс на победу:** {winners_count}/{participants_count}\n"
+                    f"**Всего участников:** {participants_count}\n"
+                    f"**Победителей:** {winners_count}"
+                ),
+                color=config.COLORS["SUCCESS"]
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-        
-        giveaway_data['participants'].append(interaction.user.id)
-        await self.update_giveaway_embed(giveaway_id, giveaway_data)
-        
-        participants_count = len(giveaway_data['participants'])
-        winners_count = giveaway_data.get('winners_count', 1)
-        
-        embed = discord.Embed(
-            title="Вы участвуете!",
-            description=(
-                f"Вы успешно зарегистрировались в розыгрыше **{giveaway_data['prize']}**!\n\n"
-                f"**Шанс на победу:** {winners_count}/{participants_count}\n"
-                f"**Всего участников:** {participants_count}\n"
-                f"**Победителей:** {winners_count}"
-            ),
-            color=config.COLORS["SUCCESS"]
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        
-        try:
-            thread = giveaway_data.get('thread')
-            if not thread and 'thread_id' in giveaway_data:
-                try:
-                    channel = self.bot.get_channel(giveaway_data['channel_id'])
-                    if channel:
-                        message = await channel.fetch_message(giveaway_data['message_id'])
-                        thread = discord.utils.get(message.threads, id=giveaway_data['thread_id'])
-                        giveaway_data['thread'] = thread
-                except:
-                    pass
             
-            if thread:
-                embed = discord.Embed(
-                    description=f"{interaction.user.mention} присоединился к розыгрышу!",
-                    color=config.COLORS["SUCCESS"]
-                )
-                embed.add_field(name="Шанс", value=f"{winners_count}/{participants_count}", inline=True)
-                embed.add_field(name="Всего", value=str(participants_count), inline=True)
-                embed.set_footer(text=f"Участник #{participants_count}")
-                await thread.send(embed=embed)
-        except Exception as e:
-            print(f"Error sending to thread: {e}")
-        
-        self.save_giveaways()
+            try:
+                thread = giveaway_data.get('thread')
+                if not thread and 'thread_id' in giveaway_data:
+                    try:
+                        channel = self.bot.get_channel(giveaway_data['channel_id'])
+                        if channel:
+                            message = await channel.fetch_message(giveaway_data['message_id'])
+                            thread = discord.utils.get(message.threads, id=giveaway_data['thread_id'])
+                            giveaway_data['thread'] = thread
+                    except:
+                        pass
+                
+                if thread:
+                    embed = discord.Embed(
+                        description=f"{interaction.user.mention} присоединился к розыгрышу!",
+                        color=config.COLORS["SUCCESS"]
+                    )
+                    embed.add_field(name="Шанс", value=f"{winners_count}/{participants_count}", inline=True)
+                    embed.add_field(name="Всего", value=str(participants_count), inline=True)
+                    embed.set_footer(text=f"Участник #{participants_count}")
+                    await thread.send(embed=embed)
+            except Exception as e:
+                print(f"Error sending to thread: {e}")
+            
+            self.save_giveaways()
+            
+        finally:
+            self.processing_users.discard(user_key)
     
     async def end_giveaway(self, giveaway_id: str, giveaway_data: dict):
         channel = self.bot.get_channel(giveaway_data['channel_id'])
@@ -747,24 +699,28 @@ class GiveawaySystem(commands.Cog):
         participants_count = len(giveaway_data['participants'])
         winners_count = giveaway_data.get('winners_count', 1)
         
-        final_content = f"# РОЗЫГРЫШ ЗАВЕРШЁН\n\n"
-        final_content += f"## {giveaway_data['prize']}\n\n"
+        embed = discord.Embed(
+            title=f"🏁 РОЗЫГРЫШ ЗАВЕРШЁН",
+            color=config.COLORS["INFO"]
+        )
+        
+        embed.add_field(name="Приз", value=giveaway_data['prize'], inline=False)
         
         if winners_count > 1:
-            final_content += f"**Победителей:** {winners_count}\n\n"
+            embed.add_field(name="Победителей", value=str(winners_count), inline=True)
         
         if giveaway_data.get('required_roles'):
-            roles_text = "\n".join([f"<@&{role_id}>" for role_id in giveaway_data['required_roles']])
-            final_content += f"**Требуемые роли:**\n{roles_text}\n\n"
+            roles_text = ", ".join([f"<@&{role_id}>" for role_id in giveaway_data['required_roles']])
+            embed.add_field(name="Требуемые роли", value=roles_text, inline=False)
         else:
-            final_content += f"**Участие:** Открыто для всех\n\n"
+            embed.add_field(name="Участие", value="Открыто для всех", inline=False)
         
-        final_content += f"**Заканчивался:** {self.format_end_time(giveaway_data['end_time'])}\n\n"
-        final_content += f"**Участников:** {participants_count}\n\n"
+        embed.add_field(name="Заканчивался", value=self.format_end_time(giveaway_data['end_time']), inline=True)
+        embed.add_field(name="Участников", value=str(participants_count), inline=True)
         
         if not giveaway_data['participants']:
-            final_content += "**К сожалению, не было участников.**"
-            await self.send_final_embed(channel, giveaway_data, final_content, [])
+            embed.description = "**К сожалению, не было участников.**"
+            await self.send_final_embed(channel, giveaway_data, embed, [])
         else:
             if winners_count >= participants_count:
                 winners = giveaway_data['participants'].copy()
@@ -783,14 +739,10 @@ class GiveawaySystem(commands.Cog):
                     winner_mentions.append(f"*Пользователь покинул сервер*")
             
             if winner_mentions:
-                final_content += f"**ПОБЕДИТЕЛИ:**\n"
-                if len(winner_mentions) == 1:
-                    final_content += f"{winner_mentions[0]}"
-                else:
-                    for i, mention in enumerate(winner_mentions, 1):
-                        final_content += f"{i}. {mention}\n"
+                winners_text = "\n".join([f"{i}. {mention}" for i, mention in enumerate(winner_mentions, 1)])
+                embed.add_field(name="🏆 ПОБЕДИТЕЛИ", value=winners_text, inline=False)
             
-            await self.send_final_embed(channel, giveaway_data, final_content, winner_members)
+            await self.send_final_embed(channel, giveaway_data, embed, winner_members)
             
             for winner in winner_members:
                 try:
@@ -826,42 +778,12 @@ class GiveawaySystem(commands.Cog):
         giveaway_data['status'] = 'ended'
         self.save_giveaways()
     
-    async def send_final_embed(self, channel, giveaway_data, content, winners):
+    async def send_final_embed(self, channel, giveaway_data, embed, winners):
         try:
-            component_data = {
-                'type': 17,
-                'accent_color': None,
-                'spoiler': False,
-                'components': [{
-                    'type': 10,
-                    'content': content
-                }]
-            }
-            
-            headers = {
-                'Authorization': f'Bot {config.TOKEN}',
-                'Content-Type': 'application/json'
-            }
-            
-            payload = {
-                'content': None,
-                'components': [component_data],
-                'flags': 32768
-            }
-            
-            url = f'https://discord.com/api/v10/channels/{channel.id}/messages/{giveaway_data["message_id"]}'
-            
-            async with aiohttp.ClientSession() as session:
-                await session.patch(url, headers=headers, json=payload)
-                
+            message = await channel.fetch_message(giveaway_data['message_id'])
+            await message.edit(embed=embed)
         except Exception as e:
             print(f"Error sending final embed: {e}")
-            embed_color = config.COLORS["SUCCESS"] if winners else config.COLORS["ERROR"]
-            embed = discord.Embed(
-                title="Розыгрыш завершён!",
-                description=content,
-                color=embed_color
-            )
             await channel.send(embed=embed)
     
     @app_commands.command(name="gstart", description="Создать новый розыгрыш")
