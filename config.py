@@ -1,0 +1,8 @@
+# config.py
+TOKEN = "YOUR_BOT_TOKEN"
+
+class COLORS:
+    SUCCESS = 0x57F287
+    ERROR = 0xED4245
+    WARNING = 0xFEE75C
+    INFO = 0x5865F2
